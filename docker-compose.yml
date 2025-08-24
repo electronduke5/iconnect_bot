@@ -1,0 +1,28 @@
+services:
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5423:5432" # Опционально: проброс порта для доступа к БД с хоста
+
+  bot:
+    build: ./bot
+    depends_on:
+      - db
+    env_file:
+      - .env
+    environment:
+      DB_HOST: db # Имя сервиса, которое Docker автоматически преобразует в IP-адрес
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASS: ${DB_PASS}
+
+volumes:
+  pgdata:
