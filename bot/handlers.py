@@ -9,6 +9,8 @@ from keyboards import get_main_keyboard, get_admin_keyboard, get_sale_price_keyb
     get_products_submenu_keyboard, get_phones_submenu_keyboard
 from filters import IsAdminFilter
 from functools import partial
+import asyncpg
+from decimal import Decimal
 
 
 # --- Функции регистрации обработчиков ---
@@ -821,10 +823,13 @@ async def handle_menu_profit(callback_query: types.CallbackQuery, db_pool):
 
         # Текущие инвестиции (непроданные товары)
         current_investments = await connection.fetchrow("""
-            SELECT 
-                COALESCE(SUM(p.purchase_price * p.quantity), 0) + 
-                COALESCE((SELECT SUM(purchase_price) FROM phones WHERE is_sold = FALSE), 0) AS total_investment
-        """)
+                                                        SELECT COALESCE(SUM(p.purchase_price * p.quantity), 0) +
+                                                               COALESCE(
+                                                                       (SELECT SUM(purchase_price) FROM phones WHERE is_sold = FALSE),
+                                                                       0) AS total_investment
+                                                        FROM products AS p
+                                                        WHERE p.is_sold = FALSE;
+                                                        """)
 
     total_profit = products_profit['profit'] + phones_profit['profit']
     total_revenue = products_profit['total_revenue'] + phones_profit['total_revenue']
@@ -1552,70 +1557,103 @@ async def handle_sale_price_input(message: types.Message, state: FSMContext, db_
 
 
 async def process_sale(db_pool, item_type, item_id, sale_price):
-    """Обрабатывает продажу товара/телефона"""
+    """
+    Обрабатывает продажу товара/телефона.
+    Добавлено подробное логирование для отладки.
+    """
+    print(f"[LOG] Начало обработки продажи. Тип: '{item_type}', ID: {item_id}, Цена продажи: {sale_price}")
+
     try:
         async with db_pool.acquire() as connection:
             async with connection.transaction():
                 if item_type == "products":
+                    print(f"[LOG] Тип товара - 'products'. Получение информации о товаре ID: {item_id}...")
+
                     # Получаем информацию о товаре
                     product = await connection.fetchrow("""
-                        SELECT name, purchase_price, is_sold 
-                        FROM products 
-                        WHERE id = $1
-                    """, item_id)
+                                                        SELECT name, purchase_price, is_sold
+                                                        FROM products
+                                                        WHERE id = $1
+                                                        """, item_id)
+                    print(f"[LOG] Полученная информация: {product}")
 
                     if not product or product['is_sold']:
+                        print(f"[ERROR] Товар ID: {item_id} не найден или уже продан. Возвращаю False.")
                         return False, 0
+
+                    print(f"[LOG] Товар '{product['name']}' найден и доступен. Обновление статуса...")
 
                     # Обновляем статус товара
                     await connection.execute("""
-                        UPDATE products 
-                        SET is_sold = TRUE, sale_price = $2 
-                        WHERE id = $1
-                    """, item_id, sale_price)
+                                             UPDATE products
+                                             SET is_sold    = TRUE,
+                                                 sale_price = $2
+                                             WHERE id = $1
+                                             """, item_id, sale_price)
 
                     # Создаем запись в транзакциях
-                    profit = sale_price - product['purchase_price']
+                    # Конвертируем sale_price в Decimal для корректного вычисления прибыли
+                    profit = Decimal(str(sale_price)) - product['purchase_price']
+                    print(f"[LOG] Создаю запись о транзакции. Прибыль: {profit}")
                     await connection.execute("""
-                        INSERT INTO transactions (product_id, type, amount, description)
-                        VALUES ($1, 'sale', $2, $3)
-                    """, item_id, sale_price, f"Продажа товара: {product['name']}")
+                                             INSERT INTO transactions (product_id, phone_id, type, amount, description)
+                                             VALUES ($1, NULL, 'sale', $2, $3)
+                                             """, item_id, sale_price, f"Продажа товара: {product['name']}")
 
+                    print(f"[SUCCESS] Продажа товара ID: {item_id} успешно завершена. Прибыль: {profit}")
                     return True, profit
 
                 elif item_type == "phones":
+                    print(f"[LOG] Тип товара - 'phones'. Получение информации о телефоне ID: {item_id}...")
+
                     # Получаем информацию о телефоне
                     phone = await connection.fetchrow("""
-                        SELECT p.name, p.purchase_price, p.is_sold,
-                               b.name AS brand_name, m.name AS model_name
-                        FROM phones p
-                        LEFT JOIN models m ON p.model_id = m.id
-                        LEFT JOIN brands b ON m.brand_id = b.id
-                        WHERE p.id = $1
-                    """, item_id)
+                                                      SELECT p.name,
+                                                             p.purchase_price,
+                                                             p.is_sold,
+                                                             b.name AS brand_name,
+                                                             m.name AS model_name
+                                                      FROM phones p
+                                                               LEFT JOIN models m ON p.model_id = m.id
+                                                               LEFT JOIN brands b ON m.brand_id = b.id
+                                                      WHERE p.id = $1
+                                                      """, item_id)
+                    print(f"[LOG] Полученная информация: {phone}")
 
                     if not phone or phone['is_sold']:
+                        print(f"[ERROR] Телефон ID: {item_id} не найден или уже продан. Возвращаю False.")
                         return False, 0
+
+                    print(f"[LOG] Телефон найден и доступен. Обновление статуса...")
 
                     # Обновляем статус телефона
                     await connection.execute("""
-                        UPDATE phones 
-                        SET is_sold = TRUE, sale_price = $2 
-                        WHERE id = $1
-                    """, item_id, sale_price)
+                                             UPDATE phones
+                                             SET is_sold    = TRUE,
+                                                 sale_price = $2
+                                             WHERE id = $1
+                                             """, item_id, sale_price)
 
                     # Создаем запись в транзакциях
-                    profit = sale_price - phone['purchase_price']
-                    phone_name = f"{phone['brand_name']} {phone['model_name']}" if phone['brand_name'] and phone['model_name'] else phone['name']
+                    # Конвертируем sale_price в Decimal для корректного вычисления прибыли
+                    profit = Decimal(str(sale_price)) - phone['purchase_price']
+                    phone_name = f"{phone['brand_name']} {phone['model_name']}" if phone['brand_name'] and phone[
+                        'model_name'] else phone['name']
+                    print(f"[LOG] Создаю запись о транзакции. Прибыль: {profit}")
                     await connection.execute("""
-                        INSERT INTO transactions (phone_id, type, amount, description)
-                        VALUES ($1, 'sale', $2, $3)
-                    """, item_id, sale_price, f"Продажа телефона: {phone_name}")
+                                             INSERT INTO transactions (product_id, phone_id, type, amount, description)
+                                             VALUES (NULL, $1, 'sale', $2, $3)
+                                             """, item_id, sale_price, f"Продажа телефона: {phone_name}")
 
+                    print(f"[SUCCESS] Продажа телефона ID: {item_id} успешно завершена. Прибыль: {profit}")
                     return True, profit
 
-        return False, 0
+                else:
+                    print(f"[ERROR] Неизвестный тип товара: '{item_type}'. Возвращаю False.")
+                    return False, 0
+
 
     except Exception as e:
-        print(f"Ошибка при продаже: {e}")
+        # Выводим подробную ошибку в консоль для отладки
+        print(f"[CRITICAL ERROR] Произошла непредвиденная ошибка при продаже: {e}")
         return False, 0
